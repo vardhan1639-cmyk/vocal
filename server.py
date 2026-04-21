@@ -2,36 +2,27 @@ from fastapi import FastAPI, APIRouter, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from typing import Optional
 from datetime import datetime, timezone
 from dotenv import load_dotenv
-import os, uuid, base64, logging
-from openai import OpenAI
+import os, uuid, logging
+from groq import Groq
 
 load_dotenv()
 
 MONGO_URL = os.environ['MONGO_URL']
 DB_NAME = os.environ.get('DB_NAME', 'vocalacademy')
-OPENAI_API_KEY = os.environ['OPENAI_API_KEY']
+GROQ_API_KEY = os.environ['GROQ_API_KEY']
 
 client_db = AsyncIOMotorClient(MONGO_URL)
 db = client_db[DB_NAME]
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+groq_client = Groq(api_key=GROQ_API_KEY)
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-LANG_GREETING = {
-    "Telugu": "Namaskaram", "Hindi": "Namaste", "Tamil": "Vanakkam",
-    "Kannada": "Namaskara", "Malayalam": "Namaskaram", "Marathi": "Namaskar",
-    "Bengali": "Nomoshkar", "Gujarati": "Namaste", "Punjabi": "Sat Sri Akal",
-    "English": "Hello", "Spanish": "Hola", "French": "Bonjour",
-    "Arabic": "Marhaba", "Japanese": "Konnichiwa", "German": "Hallo",
-    "Mandarin": "Ni hao", "Korean": "Annyeong"
-}
 
 class StartSessionRequest(BaseModel):
     mother_tongue: str
@@ -41,7 +32,7 @@ class StartSessionRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     session_id: str
-    audio_base64: str
+    user_text: str
     device_id: str
 
 class EndSessionRequest(BaseModel):
@@ -56,21 +47,16 @@ async def health():
 async def start_session(req: StartSessionRequest):
     try:
         session_id = str(uuid.uuid4())
-        greeting = LANG_GREETING.get(req.mother_tongue, "Hello")
-        
-        system_prompt = f"""You are Voca, a friendly multilingual language tutor. 
+
+        system_prompt = f"""You are Voca, a friendly multilingual language tutor.
 The student's mother tongue is {req.mother_tongue} and they are learning {req.target_language} at {req.level} level.
 Always teach in {req.target_language} but when introducing new words or when the student seems confused, explain the meaning in {req.mother_tongue}.
 Keep all responses under 2 sentences strictly. This is a real-time voice app.
-Be warm, energetic and encouraging. Remember what words you have taught and don't repeat them."""
+Be warm, energetic and encouraging. Remember what words you have taught and dont repeat them.
+After every 5 exchanges give a short encouragement in {req.mother_tongue}."""
 
-        intro = f"{greeting}! I am Voca, your {req.target_language} tutor. Let's start learning together! Tell me your name."
-        
-        tts_response = openai_client.audio.speech.create(
-            model="tts-1", voice="nova", input=intro, speed=1.15
-        )
-        audio_b64 = base64.b64encode(tts_response.content).decode()
-        
+        intro = f"Hello! I am Voca, your {req.target_language} tutor. Let us start learning together! Tell me your name."
+
         await db.sessions.insert_one({
             "session_id": session_id,
             "device_id": req.device_id,
@@ -80,10 +66,11 @@ Be warm, energetic and encouraging. Remember what words you have taught and don'
             "system_prompt": system_prompt,
             "messages": [{"role": "assistant", "content": intro}],
             "words_learned": [],
+            "exchange_count": 0,
             "created_at": datetime.now(timezone.utc).isoformat()
         })
-        
-        return {"session_id": session_id, "audio_base64": audio_b64, "text": intro}
+
+        return {"session_id": session_id, "text": intro}
     except Exception as e:
         logger.error(f"Start session error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -94,40 +81,26 @@ async def chat(req: ChatRequest):
         session = await db.sessions.find_one({"session_id": req.session_id})
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
-        
-        audio_bytes = base64.b64decode(req.audio_base64)
-        
-        import io
-        audio_file = io.BytesIO(audio_bytes)
-        audio_file.name = "audio.wav"
-        
-        transcript = openai_client.audio.transcriptions.create(
-            model="whisper-1", file=audio_file
-        )
-        user_text = transcript.text
-        
+
         messages = session.get("messages", [])
-        messages.append({"role": "user", "content": user_text})
-        
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+        messages.append({"role": "user", "content": req.user_text})
+
+        response = groq_client.chat.completions.create(
+            model="llama3-8b-8192",
             messages=[{"role": "system", "content": session["system_prompt"]}] + messages[-10:],
             max_tokens=150
         )
         assistant_text = response.choices[0].message.content
         messages.append({"role": "assistant", "content": assistant_text})
-        
-        tts_response = openai_client.audio.speech.create(
-            model="tts-1", voice="nova", input=assistant_text, speed=1.15
-        )
-        audio_b64 = base64.b64encode(tts_response.content).decode()
-        
+
+        exchange_count = session.get("exchange_count", 0) + 1
+
         await db.sessions.update_one(
             {"session_id": req.session_id},
-            {"$set": {"messages": messages}}
+            {"$set": {"messages": messages, "exchange_count": exchange_count}}
         )
-        
-        return {"audio_base64": audio_b64, "text": assistant_text, "user_text": user_text}
+
+        return {"text": assistant_text, "user_text": req.user_text}
     except Exception as e:
         logger.error(f"Chat error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -138,20 +111,18 @@ async def end_session(req: EndSessionRequest):
         session = await db.sessions.find_one({"session_id": req.session_id})
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
-        
-        summary = f"Great session! You practiced {session['target_language']} today. Keep it up!"
-        
-        tts_response = openai_client.audio.speech.create(
-            model="tts-1", voice="nova", input=summary, speed=1.15
-        )
-        audio_b64 = base64.b64encode(tts_response.content).decode()
-        
+
+        messages = session.get("messages", [])
+        exchange_count = session.get("exchange_count", 0)
+
+        summary = f"Great session! You had {exchange_count} exchanges practicing {session['target_language']}. Keep it up!"
+
         await db.sessions.update_one(
             {"session_id": req.session_id},
             {"$set": {"ended_at": datetime.now(timezone.utc).isoformat()}}
         )
-        
-        return {"summary_text": summary, "audio_base64": audio_b64}
+
+        return {"summary_text": summary}
     except Exception as e:
         logger.error(f"End session error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
